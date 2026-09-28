@@ -1,0 +1,192 @@
+#!/bin/sh
+#
+# Downlink installer.
+#
+#   curl -fsSL https://downlink.sh/install | sh
+#
+# Downloads the release build for this machine, checks it against the
+# published SHA-256, and puts the binary in ~/.local/bin. Nothing is
+# compiled, so no Rust toolchain is needed.
+#
+# This script is piped into a shell by people who have not read it, so it
+# holds to three rules:
+#
+#   1. Fail closed. Any unexpected condition — unknown platform, missing
+#      checksum, mismatched hash, failed download — stops before anything
+#      is written outside the temp directory.
+#   2. Touch nothing but the install directory. No shell profile is
+#      edited, no config is written, no existing database is read. If the
+#      install directory is not on PATH, the script says so and lets the
+#      reader decide.
+#   3. Leave nothing behind. The temp directory is removed on every exit
+#      path, including interruption.
+#
+# Environment overrides, all optional:
+#
+#   DOWNLINK_VERSION   a tag such as v0.2.0 (default: the latest release)
+#   DOWNLINK_PREFIX    install directory (default: ~/.local/bin)
+#   DOWNLINK_BASE_URL  where release assets live, for testing a mirror
+#
+# POSIX sh on purpose: /bin/sh on a Debian container is dash, and bashisms
+# here would fail on exactly the machines least able to report why.
+
+set -eu
+
+REPO="deep-visionlab/downlink-releases"
+BASE_URL="${DOWNLINK_BASE_URL:-https://github.com/$REPO/releases/download}"
+LATEST_URL="https://api.github.com/repos/$REPO/releases/latest"
+PREFIX="${DOWNLINK_PREFIX:-$HOME/.local/bin}"
+BIN_NAME="downlink"
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+die()  { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+
+# ----------------------------------------------------------------------
+# what this machine is
+#
+# The target triple has to match the one the release workflow builds
+# under, or the download 404s with no explanation. Unknown combinations
+# stop here rather than guessing a nearby one: a wrong binary either
+# fails to exec or, worse, half works.
+# ----------------------------------------------------------------------
+
+detect_target() {
+    os="$(uname -s)"
+    arch="$(uname -m)"
+
+    case "$os" in
+        Darwin) os_part="apple-darwin" ;;
+        Linux)  os_part="unknown-linux-gnu" ;;
+        *) die "Downlink has no build for $os. macOS and Linux only for now." ;;
+    esac
+
+    case "$arch" in
+        arm64|aarch64) arch_part="aarch64" ;;
+        x86_64|amd64)  arch_part="x86_64" ;;
+        *) die "Downlink has no build for $arch." ;;
+    esac
+
+    # The two combinations the release does not build, named here rather
+    # than left to fail as a 404 halfway through the download: someone on
+    # an Intel Mac deserves to hear that it is the Mac, not the network.
+    case "$arch_part-$os_part" in
+        x86_64-apple-darwin)
+            die "Downlink ships for Apple Silicon Macs only (M1 and later). Intel Macs are not supported yet." ;;
+        aarch64-unknown-linux-gnu)
+            die "Downlink ships for x86_64 Linux only for now. ARM Linux is not supported yet." ;;
+    esac
+
+    printf '%s-%s\n' "$arch_part" "$os_part"
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed."
+}
+
+# ----------------------------------------------------------------------
+# checksums
+#
+# Verified with whichever tool the platform ships: coreutils sha256sum on
+# Linux, shasum on macOS. Both are compared by hand rather than through
+# `sha256sum --check`, because the published file lists every platform's
+# asset and --check treats the absent ones as failures.
+# ----------------------------------------------------------------------
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        die "no sha256sum or shasum on this machine, so the download cannot be verified."
+    fi
+}
+
+resolve_version() {
+    if [ -n "${DOWNLINK_VERSION:-}" ]; then
+        printf '%s\n' "$DOWNLINK_VERSION"
+        return
+    fi
+    # The tag name out of the release JSON, without pulling in jq.
+    tag="$(curl -fsSL "$LATEST_URL" 2>/dev/null |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -1)"
+    [ -n "$tag" ] || die "could not find the latest release. Set DOWNLINK_VERSION to a tag."
+    printf '%s\n' "$tag"
+}
+
+# ----------------------------------------------------------------------
+# install
+# ----------------------------------------------------------------------
+
+main() {
+    need curl
+    need tar
+
+    target="$(detect_target)"
+    version="$(resolve_version)"
+    archive="${BIN_NAME}-${version}-${target}.tar.gz"
+
+    say "downlink ${version} · ${target}"
+
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/downlink-install.XXXXXX")" ||
+        die "could not create a temp directory."
+    # Runs on success, failure and interruption: a half-finished install
+    # must not leave an archive in /tmp that someone later trusts.
+    trap 'rm -rf "$tmp"' EXIT INT TERM
+
+    info "downloading ${archive}"
+    curl -fsSL "$BASE_URL/$version/$archive" -o "$tmp/$archive" ||
+        die "could not download $archive — that build may not exist for this release."
+
+    info "verifying checksum"
+    curl -fsSL "$BASE_URL/$version/SHA256SUMS" -o "$tmp/SHA256SUMS" ||
+        die "could not download SHA256SUMS. Refusing to install an unverified binary."
+
+    expected="$(grep " $archive\$" "$tmp/SHA256SUMS" | cut -d' ' -f1 | head -1)"
+    [ -n "$expected" ] ||
+        die "$archive is not listed in SHA256SUMS. Refusing to install it."
+
+    actual="$(sha256_of "$tmp/$archive")"
+    [ "$expected" = "$actual" ] || die "checksum mismatch for $archive.
+  expected  $expected
+  actual    $actual
+Nothing was installed. This is worth reporting."
+
+    info "unpacking"
+    tar -xzf "$tmp/$archive" -C "$tmp" ||
+        die "could not unpack $archive."
+    [ -f "$tmp/$BIN_NAME" ] ||
+        die "$archive did not contain a $BIN_NAME binary."
+
+    mkdir -p "$PREFIX" || die "could not create $PREFIX."
+    # Written to a temp name in the destination, then renamed: a rename
+    # within one filesystem is atomic, so an interrupted install can
+    # never leave a truncated binary where a working one was.
+    chmod 755 "$tmp/$BIN_NAME"
+    mv "$tmp/$BIN_NAME" "$PREFIX/$BIN_NAME.new" ||
+        die "could not write to $PREFIX."
+    mv "$PREFIX/$BIN_NAME.new" "$PREFIX/$BIN_NAME" ||
+        die "could not replace $PREFIX/$BIN_NAME."
+
+    say ""
+    say "Installed $PREFIX/$BIN_NAME"
+
+    case ":$PATH:" in
+        *":$PREFIX:"*)
+            say "Run: downlink"
+            ;;
+        *)
+            say ""
+            say "$PREFIX is not on your PATH. Add this to your shell profile:"
+            say "  export PATH=\"\$PATH:$PREFIX\""
+            say "Or run it directly: $PREFIX/$BIN_NAME"
+            ;;
+    esac
+
+    say ""
+    say "First run: pick an AI service with /model, then /refresh."
+}
+
+main "$@"
