@@ -42,6 +42,25 @@ say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
 die()  { printf '\nerror: %s\n' "$*" >&2; exit 1; }
 
+# Every fetch pins the scheme and a minimum TLS version, rather than
+# trusting whatever curl or the environment would otherwise negotiate: a
+# downgrade to plain http, or a weak TLS version accepted by an
+# intercepting proxy, would be invisible to someone piping this into `sh`
+# without reading it first.
+fetch() {
+    curl --proto '=https' --tlsv1.2 -fsSL "$@"
+}
+
+# The Ed25519 public key that signs SHA256SUMS (release.yml's `publish`
+# job holds the matching private key; `downlink upgrade` verifies against
+# this same key, see downlink-tui/src/upgrade/sign.rs). Embedded here
+# rather than fetched: fetching it over the same channel as the thing it
+# verifies would make the signature check provide no guarantee beyond the
+# TLS connection itself.
+RELEASE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA9623S0hsk3ldOL8LK+LMEhMHUJuD8vDjTLB0I/RZXTY=
+-----END PUBLIC KEY-----'
+
 # ----------------------------------------------------------------------
 # what this machine is
 #
@@ -77,7 +96,36 @@ detect_target() {
             die "Downlink ships for x86_64 Linux only for now. ARM Linux is not supported yet." ;;
     esac
 
+    case "$os_part" in
+        unknown-linux-gnu) check_linux_libc ;;
+    esac
+
     printf '%s-%s\n' "$arch_part" "$os_part"
+}
+
+# The Linux build is dynamically linked against glibc, and is built and
+# tested to start on glibc 2.28 and newer (RHEL/Rocky/Alma 8, Debian 10,
+# Ubuntu 18.10, and everything since). Say so up front rather than let
+# the loader fail with "GLIBC_x.y not found" after the download.
+MIN_GLIBC="2.28"
+
+check_linux_libc() {
+    # glibc prints its version to stdout; musl prints to stderr and exits
+    # non-zero, hence the redirect and the `|| true`.
+    ldd_out="$(ldd --version 2>&1 || true)"
+    case "$ldd_out" in
+        *musl*)
+            die "This system uses musl libc (Alpine and similar). Downlink needs glibc and is not built for musl yet." ;;
+    esac
+
+    # "ldd (Ubuntu GLIBC 2.35-0ubuntu3.8) 2.35" -> "2.35". If the last word
+    # is not a version, say nothing and let the binary speak for itself.
+    have="$(printf '%s\n' "$ldd_out" | head -n 1 | awk '{print $NF}')"
+    printf '%s' "$have" | grep -Eq '^[0-9]+\.[0-9]+$' || return 0
+
+    if [ "$(printf '%s\n%s\n' "$have" "$MIN_GLIBC" | sort -V | head -n 1)" != "$MIN_GLIBC" ]; then
+        die "This system has glibc $have; Downlink needs glibc $MIN_GLIBC or newer (Ubuntu 18.10+, Debian 10+, RHEL/Rocky/Alma 8+, Fedora)."
+    fi
 }
 
 need() {
@@ -105,14 +153,22 @@ sha256_of() {
 
 resolve_version() {
     if [ -n "${DOWNLINK_VERSION:-}" ]; then
-        printf '%s\n' "$DOWNLINK_VERSION"
-        return
+        tag="$DOWNLINK_VERSION"
+    else
+        # The tag name out of the release JSON, without pulling in jq.
+        tag="$(fetch "$LATEST_URL" 2>/dev/null |
+            sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+            head -1)"
+        [ -n "$tag" ] || die "could not find the latest release. Set DOWNLINK_VERSION to a tag."
     fi
-    # The tag name out of the release JSON, without pulling in jq.
-    tag="$(curl -fsSL "$LATEST_URL" 2>/dev/null |
-        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-        head -1)"
-    [ -n "$tag" ] || die "could not find the latest release. Set DOWNLINK_VERSION to a tag."
+    # Whether typed by the caller or scraped from the API response, this is
+    # about to become part of two download URLs — checked against the same
+    # strict shape the release workflow itself enforces before a tag is
+    # ever built (release.yml's `setup` job), rather than trusted as-is. A
+    # shell `case` glob can't express "digits only" (`v[0-9]*.[0-9]*.[0-9]*`
+    # would still accept "v1.2.3-anything"), so this uses `grep -E` instead.
+    printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' ||
+        die "\"$tag\" is not a valid release tag (want vMAJOR.MINOR.PATCH)."
     printf '%s\n' "$tag"
 }
 
@@ -137,11 +193,11 @@ main() {
     trap 'rm -rf "$tmp"' EXIT INT TERM
 
     info "downloading ${archive}"
-    curl -fsSL "$BASE_URL/$version/$archive" -o "$tmp/$archive" ||
+    fetch "$BASE_URL/$version/$archive" -o "$tmp/$archive" ||
         die "could not download $archive — that build may not exist for this release."
 
     info "verifying checksum"
-    curl -fsSL "$BASE_URL/$version/SHA256SUMS" -o "$tmp/SHA256SUMS" ||
+    fetch "$BASE_URL/$version/SHA256SUMS" -o "$tmp/SHA256SUMS" ||
         die "could not download SHA256SUMS. Refusing to install an unverified binary."
 
     expected="$(grep " $archive\$" "$tmp/SHA256SUMS" | cut -d' ' -f1 | head -1)"
@@ -154,9 +210,33 @@ main() {
   actual    $actual
 Nothing was installed. This is worth reporting."
 
+    # SHA256SUMS matching the archive only proves the archive matches what
+    # the server just sent — not that the server (or a compromised mirror,
+    # or a DNS hijack) is honest. The release signs SHA256SUMS itself
+    # (release.yml's `publish` job); verifying that signature, when
+    # `openssl` is on the machine, gives the same guarantee `downlink
+    # upgrade` already gives itself rather than trusting the channel alone.
+    if command -v openssl >/dev/null 2>&1; then
+        info "verifying signature"
+        fetch "$BASE_URL/$version/SHA256SUMS.sig" -o "$tmp/SHA256SUMS.sig" ||
+            die "could not download SHA256SUMS.sig. Refusing to install an unverified binary."
+        printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$tmp/release-signing.pub.pem"
+        openssl pkeyutl -verify -rawin -pubin -inkey "$tmp/release-signing.pub.pem" \
+            -sigfile "$tmp/SHA256SUMS.sig" -in "$tmp/SHA256SUMS" >/dev/null 2>&1 ||
+            die "SHA256SUMS.sig does not verify against the release key. Refusing to install it.
+This is worth reporting."
+    else
+        info "openssl not found; skipping signature verification (checksum only)"
+    fi
+
     info "unpacking"
-    tar -xzf "$tmp/$archive" -C "$tmp" ||
-        die "could not unpack $archive."
+    # Only the one entry this script wants, not everything the archive
+    # contains: the archive is checksum- (and usually signature-) verified
+    # above, but naming the member explicitly means a tampered or
+    # unexpected archive still can't place an extra file (a path-traversal
+    # name, a symlink) anywhere this script wasn't already going to look.
+    tar -xzf "$tmp/$archive" -C "$tmp" "$BIN_NAME" ||
+        die "could not unpack $BIN_NAME from $archive."
     [ -f "$tmp/$BIN_NAME" ] ||
         die "$archive did not contain a $BIN_NAME binary."
 
@@ -167,6 +247,18 @@ Nothing was installed. This is worth reporting."
     chmod 755 "$tmp/$BIN_NAME"
     mv "$tmp/$BIN_NAME" "$PREFIX/$BIN_NAME.new" ||
         die "could not write to $PREFIX."
+
+    # Proven to actually run before it replaces a working install: a
+    # binary that passed its checksum can still be the wrong build (wrong
+    # arch, or a mismatched filename shipped by CI) — that fails loudly
+    # here instead of leaving an existing, working `downlink` overwritten
+    # by one that doesn't start.
+    "$PREFIX/$BIN_NAME.new" --version >/dev/null 2>&1 || {
+        rm -f "$PREFIX/$BIN_NAME.new"
+        die "the downloaded binary did not run (--version failed). Nothing was replaced.
+This is worth reporting."
+    }
+
     mv "$PREFIX/$BIN_NAME.new" "$PREFIX/$BIN_NAME" ||
         die "could not replace $PREFIX/$BIN_NAME."
 
